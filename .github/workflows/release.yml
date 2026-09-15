@@ -1,0 +1,176 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '发布版本号（不含 v，例如 1.0.0）'
+        required: true
+        default: '1.0.0'
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - id: ver
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+            TAG="v${VERSION}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+            VERSION="${TAG#v}"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "release version=${VERSION} tag=${TAG}"
+
+  docker:
+    needs: meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Lowercase repo
+        id: repo
+        run: echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Build and push server image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/server/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.repo }}-server:${{ needs.meta.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.repo }}-server:latest
+      - name: Build and push web image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: apps/web/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.repo }}-web:${{ needs.meta.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.repo }}-web:latest
+
+  desktop:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+            script: dist:win
+            artifacts: |
+              desktop/release/*.exe
+          - os: macos-latest
+            platform: mac
+            script: dist:mac
+            artifacts: |
+              desktop/release/*.dmg
+              desktop/release/*.zip
+          - os: ubuntu-latest
+            platform: linux
+            script: dist:linux
+            artifacts: |
+              desktop/release/*.AppImage
+              desktop/release/*.deb
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - name: Install dependencies
+        run: pnpm install --no-frozen-lockfile
+      - name: Prepare desktop runtime
+        env:
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+        run: node desktop/scripts/prepare-runtime.mjs
+      - name: Install desktop dev deps
+        working-directory: desktop
+        run: npm install --no-audit --no-fund
+      - name: Build desktop (${{ matrix.platform }})
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder -c.extraMetadata.version=${{ needs.meta.outputs.version }} --${{ matrix.platform }} --publish never
+      - name: Upload desktop artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: desktop-${{ matrix.platform }}
+          path: ${{ matrix.artifacts }}
+          if-no-files-found: error
+
+  release:
+    needs: [meta, desktop]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download all desktop artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-artifacts
+      - name: Collect assets
+        run: |
+          mkdir -p release-assets
+          find dist-artifacts -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \) -exec cp {} release-assets/ \;
+          ls -lh release-assets
+      - name: Build release notes
+        run: |
+          {
+            echo "# 竞策智能体 ${{ needs.meta.outputs.tag }}"
+            echo ""
+            echo "自进化标书 Agent —— 上传招标文件即可自动生成投标文件，人工修订持续沉淀为经验。"
+            echo ""
+            echo "## 桌面端（本地一体化运行时）"
+            echo "- Windows: \`bidstrat-agent-setup-*.exe\`"
+            echo "- macOS: \`*.dmg\` / \`*.zip\`"
+            echo "- Linux: \`*.AppImage\` / \`*.deb\`"
+            echo ""
+            echo "## 服务端镜像（GHCR）"
+            echo "- \`ghcr.io/${{ github.repository }}-server:${{ needs.meta.outputs.version }}\`"
+            echo "- \`ghcr.io/${{ github.repository }}-web:${{ needs.meta.outputs.version }}\`"
+            echo ""
+            echo "## 默认账号"
+            echo "- 管理员：\`admin / admin123\`"
+            echo "- 投标专员：\`user / user123\`"
+          } > release-body.md
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.meta.outputs.tag }}
+          name: 竞策智能体 ${{ needs.meta.outputs.tag }}
+          body_path: release-body.md
+          files: release-assets/*
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

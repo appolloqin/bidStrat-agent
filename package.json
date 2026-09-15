@@ -1,0 +1,25 @@
+{
+  "name": "bidstrat-agent",
+  "version": "1.0.0",
+  "private": true,
+  "description": "竞策智能体 —— 自进化标书 Agent（全链路投标 AI 助手）",
+  "packageManager": "pnpm@10.15.1",
+  "scripts": {
+    "dev": "concurrently -k -n server,web -c blue,green \"pnpm --filter @bidstrat/server dev\" \"pnpm --filter @bidstrat/web build:watch\"",
+    "dev:web": "pnpm --filter @bidstrat/web dev",
+    "predev": "pnpm --filter @bidstrat/shared build && pnpm --filter @bidstrat/web build",
+    "start": "pnpm run dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "desktop:install": "npm --prefix desktop install",
+    "desktop:prepare": "node desktop/scripts/prepare-runtime.mjs",
+    "desktop:dev": "npm --prefix desktop run dev",
+    "desktop:dist": "npm --prefix desktop run dist"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,50 @@
+html, body, #root {
+  height: 100%;
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+.layout {
+  min-height: 100vh;
+}
+.logo {
+  color: #fff;
+  font-size: 18px;
+  font-weight: 600;
+  padding: 16px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.brand-bar {
+  height: 4px;
+  background: linear-gradient(90deg, #1677ff 0%, #69b1ff 100%);
+}
+.muted {
+  color: rgba(0, 0, 0, 0.45);
+}
+.pipeline {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 8px;
+}
+.pipeline-step {
+  border: 1px solid #e5e7eb;
+  border-radius: 8px;
+  padding: 12px;
+  background: #fafafa;
+}
+.pipeline-step.done { background: #f6ffed; border-color: #b7eb8f; }
+.pipeline-step.running { background: #e6f4ff; border-color: #91caff; }
+.pipeline-step.failed { background: #fff1f0; border-color: #ffa39e; }
+.event-log {
+  max-height: 360px;
+  overflow: auto;
+  font-family: 'Consolas', 'Monaco', monospace;
+  font-size: 12px;
+  background: #0b1220;
+  color: #c9d1d9;
+  padding: 12px;
+  border-radius: 6px;
+}
+.diff-card { background: #fafafa; padding: 12px; border-radius: 6px; }
+.tag-row { display: flex; flex-wrap: wrap; gap: 4px; }

@@ -1,0 +1,19 @@
+node_modules
+dist
+dist-ssr
+*.local
+.env
+.env.*
+!.env.example
+data/
+uploads/
+.DS_Store
+*.log
+docs/
+README.local.md
+
+# desktop
+desktop/runtime/
+desktop/release/
+desktop/.cache/
+desktop/node_modules/

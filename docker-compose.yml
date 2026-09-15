@@ -1,0 +1,57 @@
+version: '3.9'
+
+services:
+  mysql:
+    image: mysql:8.0
+    restart: always
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: bidstrat
+      MYSQL_USER: bidstrat
+      MYSQL_PASSWORD: bidstrat
+    ports:
+      - '3306:3306'
+    volumes:
+      - mysql_data:/var/lib/mysql
+    command:
+      - --character-set-server=utf8mb4
+      - --collation-server=utf8mb4_unicode_ci
+
+  server:
+    build:
+      context: .
+      dockerfile: apps/server/Dockerfile
+    restart: always
+    depends_on:
+      - mysql
+    environment:
+      PORT: 3000
+      DB_TYPE: mysql
+      DB_HOST: mysql
+      DB_PORT: 3306
+      DB_USER: bidstrat
+      DB_PASSWORD: bidstrat
+      DB_NAME: bidstrat
+      JWT_SECRET: change-me-in-prod
+      LLM_BASE_URL: ${LLM_BASE_URL:-https://api.openai.com/v1}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-gpt-4o-mini}
+      UPLOAD_DIR: /app/uploads
+    ports:
+      - '3000:3000'
+    volumes:
+      - uploads:/app/uploads
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    restart: always
+    depends_on:
+      - server
+    ports:
+      - '5173:80'
+
+volumes:
+  mysql_data:
+  uploads:
