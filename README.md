@@ -114,18 +114,23 @@ pnpm desktop:dist       # 打包当前平台安装包 → desktop/release/
 
 ## 自动发布（GitHub Actions）
 
-推送 `v*` 标签即触发 `.github/workflows/release.yml`：
+推送 **main / master**（或手动 Run workflow）即自动升版本号并发布。
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git push origin main
+# 或：Actions → Release → Run workflow
 ```
 
 自动完成：
-1. 构建并推送服务端 / 前端镜像到 GHCR（`ghcr.io/<owner>/<repo>-server`、`-web`）；
-2. 在 Windows / macOS / Linux 三平台打包桌面安装包（NSIS、dmg/zip、AppImage/deb）；
-3. 汇总产物并创建 GitHub Release。
+1. 按已有 `v*` / `x.y.z` tag **patch +1**（首次为 `v1.0.0`）；
+2. 构建 server / web Docker 镜像，产物含 `*-linux-amd64.tar.gz`，发版时推送到 GHCR  
+   （`ghcr.io/<owner>/bidstrat-agent-server`、`bidstrat-agent-web`）；
+3. 在 Windows / macOS / Linux 分别打包桌面安装包（NSIS、dmg/zip、AppImage/deb）；
+4. 汇总上述产物创建 **GitHub Release**。
 
-`.github/workflows/ci.yml` 在 push / PR 时执行 `pnpm -r typecheck` 与 `pnpm -r build`。
+PR 与非主干分支只会构建产物，**不推 GHCR、不发 Release**。
+
+日常 CI（`.github/workflows/ci.yml`）在 push / PR 时执行 `pnpm -r typecheck` 与 `pnpm -r build`。
 
 ## 自进化闭环
 

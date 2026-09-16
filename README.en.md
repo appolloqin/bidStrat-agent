@@ -105,16 +105,21 @@ To skip downloading the embedded Node, use `BIDSTRAT_SKIP_NODE=1 pnpm desktop:pr
 
 ## Automated Releases (GitHub Actions)
 
-Pushing a `v*` tag triggers `.github/workflows/release.yml`:
+Aligned with the `huohuo-drama` release model: pushing **main / master** (or manually running the workflow) auto-bumps the version and publishes.
 
 ```bash
-git tag v1.0.0 && git push origin v1.0.0
+git push origin main
+# or: Actions → Release → Run workflow
 ```
 
 It automatically:
-1. Builds and pushes the server / frontend images to GHCR (`ghcr.io/<owner>/<repo>-server`, `-web`);
-2. Packages desktop installers for Windows / macOS / Linux (NSIS, dmg/zip, AppImage/deb);
-3. Aggregates artifacts and creates a GitHub Release.
+1. Bumps **patch +1** from the latest `v*` / `x.y.z` tag (first release is `v1.0.0`);
+2. Builds server / web Docker images, ships `*-linux-amd64.tar.gz`, and on release pushes to GHCR  
+   (`ghcr.io/<owner>/bidstrat-agent-server`, `bidstrat-agent-web`);
+3. Packages desktop installers on Windows / macOS / Linux (NSIS, dmg/zip, AppImage/deb);
+4. Aggregates artifacts into a **GitHub Release**.
+
+PRs and non-trunk branches only build artifacts — **no GHCR push, no Release**.
 
 `.github/workflows/ci.yml` runs `pnpm -r typecheck` and `pnpm -r build` on every push / PR.
 

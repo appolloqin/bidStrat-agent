@@ -1,103 +1,136 @@
-name: release
+# push main/master → 自动 bump v* + Docker (GHCR + tar) + 桌面 Win/Mac/Linux → GitHub Release
+# PR / 非主干：只构建产物（不推 GHCR、不发 Release）
+name: Release
 
 on:
   push:
-    tags:
-      - 'v*'
+    branches: [main, master]
+  pull_request:
   workflow_dispatch:
-    inputs:
-      version:
-        description: '发布版本号（不含 v，例如 1.0.0）'
-        required: true
-        default: '1.0.0'
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
-  meta:
+  prepare:
+    name: Version
     runs-on: ubuntu-latest
     outputs:
-      version: ${{ steps.ver.outputs.version }}
+      pkg_ver: ${{ steps.ver.outputs.pkg_ver }}
       tag: ${{ steps.ver.outputs.tag }}
+      desktop_ver: ${{ steps.ver.outputs.desktop_ver }}
+      do_release: ${{ steps.ver.outputs.do_release }}
+      image_server: ${{ steps.ver.outputs.image_server }}
+      image_web: ${{ steps.ver.outputs.image_web }}
     steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
       - id: ver
+        name: Resolve version
         shell: bash
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            VERSION="${{ github.event.inputs.version }}"
-            TAG="v${VERSION}"
-          else
-            TAG="${GITHUB_REF_NAME}"
-            VERSION="${TAG#v}"
+          set -euo pipefail
+          short="$(git rev-parse --short HEAD)"
+          owner_lc="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
+          echo "image_server=ghcr.io/${owner_lc}/bidstrat-agent-server" >> "$GITHUB_OUTPUT"
+          echo "image_web=ghcr.io/${owner_lc}/bidstrat-agent-web" >> "$GITHUB_OUTPUT"
+
+          on_trunk=false
+          if [[ "${GITHUB_REF}" == refs/heads/main || "${GITHUB_REF}" == refs/heads/master ]]; then
+            on_trunk=true
           fi
-          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
-          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          echo "release version=${VERSION} tag=${TAG}"
+
+          if [[ "$on_trunk" == true ]] && \
+             [[ "${GITHUB_EVENT_NAME}" == push || "${GITHUB_EVENT_NAME}" == workflow_dispatch ]]; then
+            git fetch --tags --force
+            latest_norm="$(
+              {
+                git tag -l 'v[0-9]*'
+                git tag -l '[0-9]*.[0-9]*.[0-9]*'
+              } | sed 's/^v//' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1 || true
+            )"
+            if [[ -z "${latest_norm}" ]]; then
+              next="v1.0.0"
+            else
+              IFS=. read -r maj min pat <<< "${latest_norm}"
+              maj="${maj:-0}"; min="${min:-0}"; pat="${pat:-0}"
+              pat=$((10#${pat} + 1))
+              next="v${maj}.${min}.${pat}"
+            fi
+            echo "pkg_ver=${next}" >> "$GITHUB_OUTPUT"
+            echo "tag=${next}" >> "$GITHUB_OUTPUT"
+            echo "desktop_ver=${next#v}" >> "$GITHUB_OUTPUT"
+            echo "do_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release version: ${next} (prev_norm=${latest_norm:-none})"
+          else
+            echo "pkg_ver=${short}" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "desktop_ver=0.0.0-ci.${GITHUB_RUN_NUMBER}" >> "$GITHUB_OUTPUT"
+            echo "do_release=false" >> "$GITHUB_OUTPUT"
+            echo "Non-release build: pkg_ver=${short} desktop_ver=0.0.0-ci.${GITHUB_RUN_NUMBER}"
+          fi
 
   docker:
-    needs: meta
+    name: Docker (linux-amd64)
+    needs: [prepare]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Lowercase repo
-        id: repo
-        run: echo "repo=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-      - name: Build and push server image
+
+      - name: Build server image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/server/Dockerfile
-          push: true
+          platforms: linux/amd64
+          load: true
           tags: |
-            ghcr.io/${{ steps.repo.outputs.repo }}-server:${{ needs.meta.outputs.version }}
-            ghcr.io/${{ steps.repo.outputs.repo }}-server:latest
-      - name: Build and push web image
+            ${{ needs.prepare.outputs.image_server }}:${{ needs.prepare.outputs.pkg_ver }}
+            ${{ needs.prepare.outputs.image_server }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build web image
         uses: docker/build-push-action@v6
         with:
           context: .
           file: apps/web/Dockerfile
-          push: true
+          platforms: linux/amd64
+          load: true
           tags: |
-            ghcr.io/${{ steps.repo.outputs.repo }}-web:${{ needs.meta.outputs.version }}
-            ghcr.io/${{ steps.repo.outputs.repo }}-web:latest
+            ${{ needs.prepare.outputs.image_web }}:${{ needs.prepare.outputs.pkg_ver }}
+            ${{ needs.prepare.outputs.image_web }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
-  desktop:
-    needs: meta
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform: win
-            script: dist:win
-            artifacts: |
-              desktop/release/*.exe
-          - os: macos-latest
-            platform: mac
-            script: dist:mac
-            artifacts: |
-              desktop/release/*.dmg
-              desktop/release/*.zip
-          - os: ubuntu-latest
-            platform: linux
-            script: dist:linux
-            artifacts: |
-              desktop/release/*.AppImage
-              desktop/release/*.deb
-    runs-on: ${{ matrix.os }}
+      - name: Save image tar.gz
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VER="${{ needs.prepare.outputs.pkg_ver }}"
+          docker save "${{ needs.prepare.outputs.image_server }}:${VER}" \
+            | gzip > "dist/bidstrat-agent-server-${VER}-linux-amd64.tar.gz"
+          docker save "${{ needs.prepare.outputs.image_web }}:${VER}" \
+            | gzip > "dist/bidstrat-agent-web-${VER}-linux-amd64.tar.gz"
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: docker-linux-amd64
+          path: dist/bidstrat-agent-*-linux-amd64.tar.gz
+          if-no-files-found: error
+
+  desktop-win:
+    name: Desktop (Windows)
+    needs: [prepare]
+    runs-on: windows-latest
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -105,72 +138,223 @@ jobs:
           version: 10.15.1
       - uses: actions/setup-node@v4
         with:
-          node-version: 22
+          node-version: '22'
           cache: pnpm
-      - name: Install dependencies
-        run: pnpm install --no-frozen-lockfile
+      - name: Set desktop package version
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p='desktop/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.V;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+        env:
+          V: ${{ needs.prepare.outputs.desktop_ver }}
+      - run: pnpm install --no-frozen-lockfile
       - name: Prepare desktop runtime
         env:
           BIDSTRAT_NODE_VERSION: '22.14.0'
         run: node desktop/scripts/prepare-runtime.mjs
-      - name: Install desktop dev deps
+      - run: npm install --no-audit --no-fund
         working-directory: desktop
-        run: npm install --no-audit --no-fund
-      - name: Build desktop (${{ matrix.platform }})
+      - run: npm run dist:win
         working-directory: desktop
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: 'false'
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: npx electron-builder -c.extraMetadata.version=${{ needs.meta.outputs.version }} --${{ matrix.platform }} --publish never
-      - name: Upload desktop artifacts
-        uses: actions/upload-artifact@v4
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+      - uses: actions/upload-artifact@v4
         with:
-          name: desktop-${{ matrix.platform }}
-          path: ${{ matrix.artifacts }}
+          name: desktop-win
+          path: desktop/release/*.exe
+          if-no-files-found: error
+
+  desktop-mac:
+    name: Desktop (macOS)
+    needs: [prepare]
+    runs-on: macos-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - name: Set desktop package version
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p='desktop/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.V;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+        env:
+          V: ${{ needs.prepare.outputs.desktop_ver }}
+      - run: pnpm install --no-frozen-lockfile
+      - name: Prepare desktop runtime
+        env:
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+        run: node desktop/scripts/prepare-runtime.mjs
+      - run: npm install --no-audit --no-fund
+        working-directory: desktop
+      - run: npm run dist:mac
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-mac
+          path: |
+            desktop/release/*.dmg
+            desktop/release/*.zip
+          if-no-files-found: error
+
+  desktop-linux:
+    name: Desktop (Linux)
+    needs: [prepare]
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.15.1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - name: Set desktop package version
+        shell: bash
+        run: |
+          node -e "const fs=require('fs');const p='desktop/package.json';const j=JSON.parse(fs.readFileSync(p,'utf8'));j.version=process.env.V;fs.writeFileSync(p,JSON.stringify(j,null,2)+'\n')"
+        env:
+          V: ${{ needs.prepare.outputs.desktop_ver }}
+      - run: pnpm install --no-frozen-lockfile
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential python3 \
+            rpm fuse libfuse2 || true
+      - name: Prepare desktop runtime
+        env:
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+        run: node desktop/scripts/prepare-runtime.mjs
+      - run: npm install --no-audit --no-fund
+        working-directory: desktop
+      - run: npm run dist:linux
+        working-directory: desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+          BIDSTRAT_NODE_VERSION: '22.14.0'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: desktop-linux
+          path: |
+            desktop/release/*.AppImage
+            desktop/release/*.deb
           if-no-files-found: error
 
   release:
-    needs: [meta, desktop]
+    name: GitHub Release
+    needs: [prepare, docker, desktop-win, desktop-mac, desktop-linux]
+    if: >-
+      always() &&
+      needs.prepare.outputs.do_release == 'true' &&
+      needs.docker.result == 'success' &&
+      needs.desktop-win.result == 'success' &&
+      needs.desktop-mac.result == 'success' &&
+      needs.desktop-linux.result == 'success'
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
     steps:
-      - uses: actions/checkout@v4
-      - name: Download all desktop artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
-          path: dist-artifacts
-      - name: Collect assets
+          path: release-assets
+          pattern: '{desktop-*,docker-*}'
+          merge-multiple: true
+
+      - name: List assets
         run: |
-          mkdir -p release-assets
-          find dist-artifacts -type f \( -name '*.exe' -o -name '*.dmg' -o -name '*.zip' -o -name '*.AppImage' -o -name '*.deb' \) -exec cp {} release-assets/ \;
-          ls -lh release-assets
-      - name: Build release notes
-        run: |
-          {
-            echo "# 竞策智能体 ${{ needs.meta.outputs.tag }}"
-            echo ""
-            echo "自进化标书 Agent —— 上传招标文件即可自动生成投标文件，人工修订持续沉淀为经验。"
-            echo ""
-            echo "## 桌面端（本地一体化运行时）"
-            echo "- Windows: \`bidstrat-agent-setup-*.exe\`"
-            echo "- macOS: \`*.dmg\` / \`*.zip\`"
-            echo "- Linux: \`*.AppImage\` / \`*.deb\`"
-            echo ""
-            echo "## 服务端镜像（GHCR）"
-            echo "- \`ghcr.io/${{ github.repository }}-server:${{ needs.meta.outputs.version }}\`"
-            echo "- \`ghcr.io/${{ github.repository }}-web:${{ needs.meta.outputs.version }}\`"
-            echo ""
-            echo "## 默认账号"
-            echo "- 管理员：\`admin / admin123\`"
-            echo "- 投标专员：\`user / user123\`"
-          } > release-body.md
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+          set -euo pipefail
+          find release-assets -type f -print
+          test -n "$(find release-assets -name '*.exe' | head -n1)"
+          test -n "$(find release-assets -name '*.dmg' | head -n1)"
+          test -n "$(find release-assets -name '*.AppImage' | head -n1)"
+          test -n "$(find release-assets -name '*-server-*-linux-amd64.tar.gz' | head -n1)"
+          test -n "$(find release-assets -name '*-web-*-linux-amd64.tar.gz' | head -n1)"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
         with:
-          tag_name: ${{ needs.meta.outputs.tag }}
-          name: 竞策智能体 ${{ needs.meta.outputs.tag }}
-          body_path: release-body.md
-          files: release-assets/*
-          draft: false
-          prerelease: false
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Load images and push to GHCR
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          IMAGE_SERVER: ${{ needs.prepare.outputs.image_server }}
+          IMAGE_WEB: ${{ needs.prepare.outputs.image_web }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          SERVER_TAR="$(find release-assets -name '*-server-*-linux-amd64.tar.gz' | head -n1)"
+          WEB_TAR="$(find release-assets -name '*-web-*-linux-amd64.tar.gz' | head -n1)"
+          gunzip -c "$SERVER_TAR" | docker load
+          gunzip -c "$WEB_TAR" | docker load
+          docker tag "${IMAGE_SERVER}:${TAG}" "${IMAGE_SERVER}:latest"
+          docker tag "${IMAGE_WEB}:${TAG}" "${IMAGE_WEB}:latest"
+          docker push "${IMAGE_SERVER}:${TAG}"
+          docker push "${IMAGE_SERVER}:latest"
+          docker push "${IMAGE_WEB}:${TAG}"
+          docker push "${IMAGE_WEB}:latest"
+
+      - name: Build release body
+        env:
+          IMAGE_SERVER: ${{ needs.prepare.outputs.image_server }}
+          IMAGE_WEB: ${{ needs.prepare.outputs.image_web }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          set -euo pipefail
+          {
+            echo "## Docker（GHCR）"
+            echo ""
+            echo "\`\`\`bash"
+            echo "docker pull ${IMAGE_SERVER}:${TAG}"
+            echo "docker pull ${IMAGE_WEB}:${TAG}"
+            echo "# 或离线加载："
+            echo "# gunzip -c bidstrat-agent-server-${TAG}-linux-amd64.tar.gz | docker load"
+            echo "# gunzip -c bidstrat-agent-web-${TAG}-linux-amd64.tar.gz | docker load"
+            echo "docker compose up -d"
+            echo "\`\`\`"
+            echo ""
+            echo "## 桌面端"
+            echo ""
+            echo "附件：Windows \`.exe\` / macOS \`.dmg\` / Linux \`.AppImage\`（及 \`.deb\`）。"
+            echo ""
+            echo "### 安装"
+            echo ""
+            echo "- **Windows**：运行 \`bidstrat-agent-setup-*.exe\`，选择安装目录完成安装。"
+            echo "- **macOS**：打开 \`.dmg\`，拖到 Applications；未签名时首次启动请右键 → 打开。"
+            echo "- **Linux**：\`chmod +x bidstrat-agent-*-linux-*.AppImage\` 后运行。"
+            echo ""
+            echo "### 模式"
+            echo ""
+            echo "- **本地（默认）**：内嵌 Node + SQLite，数据在系统用户目录。"
+            echo "- **远程**：菜单「模式 → 设置远程控制台地址…」。"
+            echo ""
+            echo "### 默认账号"
+            echo ""
+            echo "| 角色 | 账号 |"
+            echo "| --- | --- |"
+            echo "| 管理员 | \`admin\` / \`admin123\` |"
+            echo "| 投标专员 | \`user\` / \`user123\` |"
+          } > release-body.md
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: 竞策智能体 ${{ needs.prepare.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          body_path: release-body.md
+          generate_release_notes: true
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: release-assets/**
