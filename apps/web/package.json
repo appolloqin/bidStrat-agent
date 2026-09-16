@@ -5,9 +5,11 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "prebuild": "pnpm --filter @bidstrat/shared build",
     "build": "tsc -b && vite build",
     "build:watch": "vite build --watch",
     "preview": "vite preview --port 5173",
+    "pretypecheck": "pnpm --filter @bidstrat/shared build",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

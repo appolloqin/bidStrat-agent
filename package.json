@@ -10,7 +10,7 @@
     "predev": "pnpm --filter @bidstrat/shared build && pnpm --filter @bidstrat/web build",
     "start": "pnpm run dev",
     "build": "pnpm -r build",
-    "typecheck": "pnpm -r typecheck",
+    "typecheck": "pnpm --filter @bidstrat/shared build && pnpm -r typecheck",
     "desktop:install": "npm --prefix desktop install",
     "desktop:prepare": "node desktop/scripts/prepare-runtime.mjs",
     "desktop:dev": "npm --prefix desktop run dev",
