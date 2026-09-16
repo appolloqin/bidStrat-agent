@@ -2,6 +2,11 @@
   "name": "bidstrat-agent-desktop",
   "version": "1.0.0",
   "description": "竞策智能体桌面端 — 本地一体化运行时或远程控制台",
+  "homepage": "https://github.com/hckj/bidStrat-agent",
+  "author": {
+    "name": "竞策智能体",
+    "email": "dev@bidstrat.local"
+  },
   "private": true,
   "type": "module",
   "main": "electron/main.mjs",
@@ -69,6 +74,9 @@
         "deb"
       ],
       "category": "Office",
+      "maintainer": "竞策智能体 <dev@bidstrat.local>",
+      "vendor": "竞策智能体",
+      "synopsis": "自进化标书 Agent 桌面端",
       "artifactName": "bidstrat-agent-${version}-linux-${arch}.${ext}"
     }
   },
