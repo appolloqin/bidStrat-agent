@@ -13,6 +13,7 @@ import { SelfReviewTool } from './tools/self-review.tool';
 import { LlmService } from '../llm/llm.service';
 import { buildPlan, buildOutlineFromTenderPositions } from './plan';
 import { planWritingByLlm } from './plan-writing';
+import { isFillInstructionOnly } from './response-slots';
 import { parseDraftResponse } from '../common/llm-parsing';
 
 export interface RunOptions {
@@ -377,12 +378,18 @@ export class AgentService implements OnApplicationBootstrap {
         : buildOutlineFromTenderPositions({ requirements: reqAnchors, clauses: clauseAnchors });
     await this.syncBidSectionsToOutline(run.projectId, outline);
 
-    const reason = `${planned.source === 'llm' ? '模型自主规划' : '回退规则'}：${planned.rationale}；共 ${outline.length} 段：${outline.map((o) => o.path).join('；')}`;
+    const reason = `${planned.source === 'llm' ? '自主规划' : '回退规则'}${planned.candidateCount != null ? `（先枚举 ${planned.candidateCount} 处候选` : ''}${planned.rounds && planned.rounds > 1 ? `，决策第 ${planned.rounds} 轮纠偏` : planned.candidateCount != null ? '，再决策' : ''}${planned.candidateCount != null ? '）' : ''}：${planned.rationale}；共写 ${outline.length} 段：${outline.map((o) => o.path).join('；')}`;
     this.emit(
       run,
       'log',
       reason,
-      { outline, mode: planned.source, rationale: planned.rationale },
+      {
+        outline,
+        mode: planned.source,
+        rationale: planned.rationale,
+        rounds: planned.rounds,
+        candidateCount: planned.candidateCount,
+      },
       step.id,
     );
     if (planned.tokens) {
@@ -390,9 +397,9 @@ export class AgentService implements OnApplicationBootstrap {
         run,
         step,
         'write_section',
-        `写作规划（${planned.source}）`,
-        { hintCount: (doc?.outline ?? []).length },
-        { chapterCount: outline.length, rationale: planned.rationale },
+        `写作规划（枚举→决策 / ${planned.source}）`,
+        { candidateCount: planned.candidateCount },
+        { chapterCount: outline.length, rationale: planned.rationale, rounds: planned.rounds },
         planned.tokens,
         0,
       );
@@ -407,7 +414,8 @@ export class AgentService implements OnApplicationBootstrap {
         let tokens = 0;
         if (resuming) {
           const existingSection = await sectionRepo.findOne({ where: { projectId: run.projectId, title: node.title } });
-          if (existingSection?.content) {
+          // 仅跳过「有实质正文」的章节；填写须知残留 / 过短不算已写
+          if (existingSection?.content && !isFillInstructionOnly(existingSection.content) && existingSection.content.trim().length >= 80) {
             this.events.emitActivity(run.projectId, `续跑跳过已生成应答【${node.title}】`);
             await this.recordSubStep(run, step, 'write_section', `续跑跳过（已有内容）：${node.title}`, { outlineNo: node.no }, { sectionId: existingSection.id, score: existingSection.reviewScore ?? 0 }, 0, 0);
             continue;
@@ -431,6 +439,12 @@ export class AgentService implements OnApplicationBootstrap {
         const sectionId = (result.output as { sectionId: string }).sectionId;
         let section = await sectionRepo.findOne({ where: { id: sectionId } });
         if (!section) continue;
+
+        if (isFillInstructionOnly(section.content ?? '')) {
+          throw new Error(
+            `章节「${node.title}」未写出实质应答（仍像填写须知/空文），写作阶段失败，请重试或检查模型`,
+          );
+        }
 
         let round = 0;
         this.events.emitActivity(run.projectId, `自评应答【${node.title}】…`);

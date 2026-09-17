@@ -26,11 +26,35 @@ export interface ChatResult {
 
 const BASE_TIMEOUT_JITTER_RATIO = 0.2;
 
+function isTimeoutError(err: Error): boolean {
+  return err.message.includes('超时') || err.message.includes('预算');
+}
+
+function isBudgetExceeded(err: Error): boolean {
+  return err.message.includes('预算');
+}
+
+/** 可重试：超时 / 限流 / 网关 / 集群过载（如 MiniMax 529） */
+function isRetryableError(err: Error): boolean {
+  if (isBudgetExceeded(err)) return false;
+  if (isTimeoutError(err)) return true;
+  const m = err.message;
+  if (/\b(429|502|503|529)\b/.test(m)) return true;
+  if (/overloaded|负载较高|rate.?limit|too many requests|temporar|unavailable|ECONNRESET|ETIMEDOUT|fetch failed/i.test(m)) {
+    return true;
+  }
+  return false;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
 @Injectable()
 export class LlmService {
   private readonly logger = new Logger(LlmService.name);
 
-  // 自适应并发控制：观测到连续超时自动降至串行，稳定后逐步回调
+  // 自适应并发控制：观测到连续超时/过载自动降至串行，稳定后逐步回调
   private readonly maxConcurrency: number;
   private active = 0;
   private waiters: Array<() => void> = [];
@@ -48,9 +72,10 @@ export class LlmService {
   }
 
   /**
-   * 自适应降级后的并发闸门：
-   * - 并发超时/拥塞时，连续失败达到阈值，将当前容量收敛到 1（串行），缓解超时；
-   * - 成功后逐步恢复正常并发上限。
+   * 自适应「并发」降级闸门（不是内容/供应商降级）：
+   * - 连续超时/过载时将当前容量收敛到 1（串行），减轻对本端与上游的压力；
+   * - 成功后恢复正常并发上限。
+   * 注意：无法消除上游 529 集群过载，仅减少我们的并发冲击。
    */
   private async withSlot<T>(fn: () => Promise<T>): Promise<T> {
     if (this.active >= this.currentCap) {
@@ -69,10 +94,11 @@ export class LlmService {
   private track(result: 'ok' | 'timeout' | 'error'): void {
     if (result === 'timeout' || result === 'error') {
       this.consecutiveFailures++;
-      // 连续失败 → 降并发到串行（上限 1）
       if (this.consecutiveFailures >= 2 && this.currentCap > 1) {
         this.currentCap = 1;
-        this.logger.warn(`LLM 连续 ${this.consecutiveFailures} 次失败，并发降级为串行（上限 1）以缓解超时`);
+        this.logger.warn(
+          `LLM 连续 ${this.consecutiveFailures} 次失败，并发降级为串行（上限 1）。此为并发降级，不会改用 Mock/其它模型`,
+        );
       }
     } else {
       this.consecutiveFailures = 0;
@@ -82,25 +108,63 @@ export class LlmService {
     }
   }
 
+  private mockResult(messages: ChatMessage[], opts: ChatOptions, model: string): ChatResult {
+    const content = sanitizeLlmOutput(mockChat(messages, opts.task));
+    return { content, tokens: Math.ceil(content.length / 3), provider: 'mock', model };
+  }
+
   async chat(messages: ChatMessage[], opts: ChatOptions = {}): Promise<ChatResult> {
-    const cfg = await this.configs.resolve(opts.tenantId);
-    if (cfg.provider === 'mock' || !cfg.apiKey) {
-      const content = sanitizeLlmOutput(mockChat(messages, opts.task));
-      return { content, tokens: Math.ceil(content.length / 3), provider: 'mock', model: cfg.model };
+    const primary = await this.configs.resolve(opts.tenantId);
+    if (primary.provider === 'mock' || !primary.apiKey) {
+      return this.mockResult(messages, opts, primary.model);
     }
 
-    // 总时长硬预算：单次 chat() 全部分支累计超过即主动抛错，不无限等待
+    const alternates = await this.configs.resolveAlternates(opts.tenantId, primary.configId);
+    const chain = [primary, ...alternates];
+
+    let lastErr: Error | null = null;
+    for (let mi = 0; mi < chain.length; mi++) {
+      const cfg = chain[mi];
+      if (mi > 0) {
+        this.logger.warn(
+          `主模型失败，切换备用模型「${cfg.configName || cfg.model}」继续请求（${mi + 1}/${chain.length}）`,
+        );
+      }
+      try {
+        return await this.chatWithConfig(cfg, messages, opts);
+      } catch (err) {
+        lastErr = err instanceof Error ? err : new Error(String(err));
+        if (isBudgetExceeded(lastErr)) throw lastErr;
+        // 不可重试类错误（如 401）不必再换模型空转；鉴权失败换其它配置仍可能有用，继续
+        this.logger.warn(`模型「${cfg.configName || cfg.model}」调用失败：${lastErr.message.slice(0, 180)}`);
+      }
+    }
+
+    if (env.llmFallbackMock) {
+      this.logger.warn('全部真实模型均失败，已按 LLM_FALLBACK_MOCK=true 降级到离线 Mock（内容仅供演示）');
+      this.track('error');
+      return this.mockResult(messages, opts, primary.model);
+    }
+
+    this.logger.error(`LLM 调用最终失败（已试 ${chain.length} 个模型）：${lastErr?.message ?? 'unknown'}`);
+    throw lastErr ?? new Error('LLM 调用失败');
+  }
+
+  /** 对单个模型配置做超时递增 + 529/429 等可重试错误的退避重试 */
+  private async chatWithConfig(
+    cfg: ResolvedLlmConfig,
+    messages: ChatMessage[],
+    opts: ChatOptions,
+  ): Promise<ChatResult> {
     const budgetMs = env.llmMaxTotalMs;
     const budgetStarted = Date.now();
     let lastErr: Error | null = null;
 
     for (let attempt = 0; attempt <= env.llmMaxRetries; attempt++) {
-      // 分级递增超时：基础超时 × 倍数^attempt（并加抖动错峰）
       const jitter = BASE_TIMEOUT_JITTER_RATIO * Math.random();
       const tierMs = env.llmTimeoutMs * Math.pow(env.llmTimeoutMul, attempt) * (1 + jitter);
       const spent = Date.now() - budgetStarted;
       const remaining = budgetMs - spent;
-      // 总时长硬预算兜底：无法再给任何分支分配有效时间 → 主动抛异常，交给断点续跑从失败处继续
       if (remaining <= 10_000) {
         const msg = `LLM 调用超出总时长预算（${Math.round(budgetMs / 60000)} 分钟），已抛出异常终止该步骤（可重新启动以断点续跑）`;
         this.logger.error(msg);
@@ -110,23 +174,24 @@ export class LlmService {
       const timeoutMs = Math.max(1, Math.min(tierMs, remaining));
 
       try {
-        // 强制进入串行/限流闸门，避免并放大超时
         const result = await this.withSlot(() => this.request(cfg, messages, opts, timeoutMs));
         this.track('ok');
         return result;
       } catch (err) {
         lastErr = err instanceof Error ? err : new Error(String(err));
-        const isTimeout = lastErr.message.includes('超时') || lastErr.message.includes('预算');
-        const isBudgetExceeded = lastErr.message.includes('预算');
-        this.track(isTimeout ? 'timeout' : 'error');
+        const timeout = isTimeoutError(lastErr);
+        this.track(timeout ? 'timeout' : 'error');
 
-        if (isBudgetExceeded || !isTimeout || attempt >= env.llmMaxRetries) {
-          this.logger.error(`LLM 调用最终失败（第 ${attempt + 1} 次）：${lastErr.message}`);
+        if (isBudgetExceeded(lastErr) || !isRetryableError(lastErr) || attempt >= env.llmMaxRetries) {
           throw lastErr;
         }
+
+        // 过载/限流：短暂退避后再试（超时已用更长窗口，仍加小退避错峰）
+        const backoffMs = Math.min(15_000, 1000 * Math.pow(2, attempt));
         this.logger.warn(
-          `LLM 调用第 ${attempt + 1} 次超时（超时 ${Math.round(timeoutMs / 1000)}s），重试第 ${attempt + 2} 次（超时放大至 ${Math.round(Math.min(tierMs * 2, budgetMs) / 1000)}s）`,
+          `LLM「${cfg.configName || cfg.model}」第 ${attempt + 1} 次失败（${timeout ? `超时 ${Math.round(timeoutMs / 1000)}s` : lastErr.message.slice(0, 80)}），${Math.round(backoffMs / 1000)}s 后重试第 ${attempt + 2} 次`,
         );
+        await sleep(backoffMs);
       }
     }
     throw lastErr ?? new Error('LLM 调用失败');
@@ -140,8 +205,7 @@ export class LlmService {
   ): Promise<ChatResult> {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
-    // AbortController 必须覆盖到响应体读取完成：reasoning 模型（如 MiniMax M3）会先返回响应头再长时间生成，
-    // 若在收到响应头后就清除定时器，body 流式读取可能无限挂起，导致运行假死被 watchdog 标记失败。
+    // AbortController 必须覆盖到响应体读取完成：reasoning 模型会先返回响应头再长时间生成
     try {
       const res = await fetch(`${cfg.baseUrl.replace(/\/$/, '')}/chat/completions`, {
         method: 'POST',
@@ -154,7 +218,6 @@ export class LlmService {
           messages,
           temperature: opts.temperature ?? cfg.temperature ?? 0.3,
           ...(opts.maxTokens ?? cfg.maxTokens ? { max_tokens: opts.maxTokens ?? cfg.maxTokens } : {}),
-          // 写作类任务强制关闭思考模式，减少 <think>/英文自检泄漏进正文
           ...((cfg.thinkingEnabled === false || opts.task === 'write_section' || opts.task === 'rewrite_section')
             ? { enable_thinking: false }
             : {}),
@@ -170,7 +233,6 @@ export class LlmService {
         choices: {
           message: {
             content?: string | null;
-            /** 部分推理模型把思考放在独立字段，绝不能拼进标书正文 */
             reasoning_content?: string | null;
             reasoning?: string | null;
           };
@@ -178,7 +240,6 @@ export class LlmService {
         usage?: { total_tokens?: number };
       };
       const msg = data.choices?.[0]?.message;
-      // 只用 content；reasoning_* 仅供模型内部，写标书必须丢弃
       const raw = msg?.content ?? '';
       return {
         content: sanitizeLlmOutput(raw),

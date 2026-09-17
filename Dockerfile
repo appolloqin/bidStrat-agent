@@ -1,4 +1,4 @@
-# 兼容旧路径：统一到仓库根 Dockerfile（API + 前端同镜像）
+# 单镜像：NestJS API + 静态前端（与 pnpm dev 同端口模型）
 FROM node:20-alpine
 WORKDIR /app
 

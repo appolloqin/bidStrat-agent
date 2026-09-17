@@ -17,15 +17,17 @@ services:
       - --character-set-server=utf8mb4
       - --collation-server=utf8mb4_unicode_ci
 
-  server:
+  # 单镜像：前端 + API，访问 http://localhost:3000/
+  app:
     build:
       context: .
-      dockerfile: apps/server/Dockerfile
+      dockerfile: Dockerfile
     restart: always
     depends_on:
       - mysql
     environment:
       PORT: 3000
+      WEB_DIST: /app/apps/web/dist
       DB_TYPE: mysql
       DB_HOST: mysql
       DB_PORT: 3306
@@ -41,16 +43,6 @@ services:
       - '3000:3000'
     volumes:
       - uploads:/app/uploads
-
-  web:
-    build:
-      context: .
-      dockerfile: apps/web/Dockerfile
-    restart: always
-    depends_on:
-      - server
-    ports:
-      - '5173:80'
 
 volumes:
   mysql_data:

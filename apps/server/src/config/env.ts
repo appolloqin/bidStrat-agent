@@ -26,8 +26,13 @@ export const env = {
   llmTimeoutMul: parseFloat(process.env.LLM_TIMEOUT_MUL || '2'),
   /** 单次 chat() 全部分支的总时长硬预算；超过即抛异常，不再无限等待 */
   llmMaxTotalMs: parseInt(process.env.LLM_MAX_TOTAL_MS || '2400000', 10),
-  /** LLM 并发上限（默认 1 = 串行）。观测到连续超时时自动降级为串行 */
+  /** LLM 并发上限（默认 1 = 串行）。观测到连续超时时自动将并发降为 1 */
   llmConcurrency: parseInt(process.env.LLM_CONCURRENCY || '1', 10),
+  /**
+   * 主模型与备用模型均失败后，是否降级到离线 Mock 以让流水线继续。
+   * 默认 false：避免静默产出演示文案；演示/弱网可设 LLM_FALLBACK_MOCK=true。
+   */
+  llmFallbackMock: (process.env.LLM_FALLBACK_MOCK || 'false') === 'true',
   uploadDir: process.env.UPLOAD_DIR || 'uploads',
   webDist: process.env.WEB_DIST || '',
   autoContinue: (process.env.AGENT_AUTO_CONTINUE || 'true') === 'true',

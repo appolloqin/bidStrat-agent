@@ -68,6 +68,20 @@ export function detectContentDefects(raw: string): ContentDefect[] {
     });
   }
 
+  if (/投标人在此处编辑|不得在上述.{0,20}原文中进行编辑/.test(text)) {
+    const rest = text
+      .replace(/投标人在此处编辑[\s\S]{0,240}/g, '')
+      .replace(/如招标文件要求中有需要投标人填写[\s\S]{0,240}/g, '');
+    const zh = (rest.match(/[\u4e00-\u9fff]/g) || []).length;
+    if (zh < 40) {
+      defects.push({
+        code: 'FILL_INSTRUCTION_ONLY',
+        message: '正文几乎只有「投标人在此处编辑…」填写须知，未写出实质投标响应',
+        maxScore: 5,
+      });
+    }
+  }
+
   // 明显半截截断：以连词/介词/顿号等收尾
   const trimmed = text.trim();
   if (trimmed.length > 80 && /[的地得与及和或在于被把将从对按]$/.test(trimmed.replace(/\s+$/u, ''))) {

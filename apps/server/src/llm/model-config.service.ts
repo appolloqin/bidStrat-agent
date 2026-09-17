@@ -76,6 +76,26 @@ export class ModelConfigService {
     return cfg;
   }
 
+  /**
+   * 主模型之外的可用备用配置（已启用、有 Key、非 mock），按默认优先、更新时间倒序。
+   * 供 LLM 服务在 529/超时等失败后切换。
+   */
+  async resolveAlternates(tenantId?: string, excludeConfigId?: string): Promise<ResolvedLlmConfig[]> {
+    if (!tenantId) return [];
+    const rows = await this.repo.find({
+      where: { tenantId, enabled: true },
+      order: { isDefault: 'DESC', updatedAt: 'DESC' },
+    });
+    const out: ResolvedLlmConfig[] = [];
+    for (const row of rows) {
+      if (excludeConfigId && row.id === excludeConfigId) continue;
+      if (row.provider === 'mock') continue;
+      const resolved = this.rowToResolved(row);
+      if (resolved?.apiKey) out.push(resolved);
+    }
+    return out;
+  }
+
   private async load(tenantId?: string): Promise<ResolvedLlmConfig> {
     if (tenantId) {
       const row =

@@ -114,8 +114,8 @@ git push origin main
 
 It automatically:
 1. Bumps **patch +1** from the latest `v*` / `x.y.z` tag (first release is `v1.0.0`);
-2. Builds server / web Docker images, ships `*-linux-amd64.tar.gz`, and on release pushes to GHCR  
-   (`ghcr.io/<owner>/bidstrat-agent-server`, `bidstrat-agent-web`);
+2. Builds a **single** Docker image (static frontend + API), ships `*-linux-amd64.tar.gz`, and on release pushes to GHCR  
+   (`ghcr.io/<owner>/bidstrat-agent`); open `http://localhost:3000/`;
 3. Packages desktop installers on Windows / macOS / Linux (NSIS, dmg/zip, AppImage/deb);
 4. Aggregates artifacts into a **GitHub Release**.
 

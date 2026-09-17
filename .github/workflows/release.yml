@@ -24,8 +24,7 @@ jobs:
       tag: ${{ steps.ver.outputs.tag }}
       desktop_ver: ${{ steps.ver.outputs.desktop_ver }}
       do_release: ${{ steps.ver.outputs.do_release }}
-      image_server: ${{ steps.ver.outputs.image_server }}
-      image_web: ${{ steps.ver.outputs.image_web }}
+      image: ${{ steps.ver.outputs.image }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -37,8 +36,7 @@ jobs:
           set -euo pipefail
           short="$(git rev-parse --short HEAD)"
           owner_lc="$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')"
-          echo "image_server=ghcr.io/${owner_lc}/bidstrat-agent-server" >> "$GITHUB_OUTPUT"
-          echo "image_web=ghcr.io/${owner_lc}/bidstrat-agent-web" >> "$GITHUB_OUTPUT"
+          echo "image=ghcr.io/${owner_lc}/bidstrat-agent" >> "$GITHUB_OUTPUT"
 
           on_trunk=false
           if [[ "${GITHUB_REF}" == refs/heads/main || "${GITHUB_REF}" == refs/heads/master ]]; then
@@ -83,29 +81,16 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
 
-      - name: Build server image
+      - name: Build all-in-one image
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: apps/server/Dockerfile
+          file: Dockerfile
           platforms: linux/amd64
           load: true
           tags: |
-            ${{ needs.prepare.outputs.image_server }}:${{ needs.prepare.outputs.pkg_ver }}
-            ${{ needs.prepare.outputs.image_server }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-
-      - name: Build web image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: apps/web/Dockerfile
-          platforms: linux/amd64
-          load: true
-          tags: |
-            ${{ needs.prepare.outputs.image_web }}:${{ needs.prepare.outputs.pkg_ver }}
-            ${{ needs.prepare.outputs.image_web }}:latest
+            ${{ needs.prepare.outputs.image }}:${{ needs.prepare.outputs.pkg_ver }}
+            ${{ needs.prepare.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
@@ -114,10 +99,8 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           VER="${{ needs.prepare.outputs.pkg_ver }}"
-          docker save "${{ needs.prepare.outputs.image_server }}:${VER}" \
-            | gzip > "dist/bidstrat-agent-server-${VER}-linux-amd64.tar.gz"
-          docker save "${{ needs.prepare.outputs.image_web }}:${VER}" \
-            | gzip > "dist/bidstrat-agent-web-${VER}-linux-amd64.tar.gz"
+          docker save "${{ needs.prepare.outputs.image }}:${VER}" \
+            | gzip > "dist/bidstrat-agent-${VER}-linux-amd64.tar.gz"
           ls -lh dist/
 
       - uses: actions/upload-artifact@v4
@@ -278,8 +261,7 @@ jobs:
           test -n "$(find release-assets -name '*.exe' | head -n1)"
           test -n "$(find release-assets -name '*.dmg' | head -n1)"
           test -n "$(find release-assets -name '*.AppImage' | head -n1)"
-          test -n "$(find release-assets -name '*-server-*-linux-amd64.tar.gz' | head -n1)"
-          test -n "$(find release-assets -name '*-web-*-linux-amd64.tar.gz' | head -n1)"
+          test -n "$(find release-assets -name '*-linux-amd64.tar.gz' | head -n1)"
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -288,41 +270,33 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Load images and push to GHCR
+      - name: Load image and push to GHCR
         env:
-          IMAGE_SERVER: ${{ needs.prepare.outputs.image_server }}
-          IMAGE_WEB: ${{ needs.prepare.outputs.image_web }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
-          SERVER_TAR="$(find release-assets -name '*-server-*-linux-amd64.tar.gz' | head -n1)"
-          WEB_TAR="$(find release-assets -name '*-web-*-linux-amd64.tar.gz' | head -n1)"
-          gunzip -c "$SERVER_TAR" | docker load
-          gunzip -c "$WEB_TAR" | docker load
-          docker tag "${IMAGE_SERVER}:${TAG}" "${IMAGE_SERVER}:latest"
-          docker tag "${IMAGE_WEB}:${TAG}" "${IMAGE_WEB}:latest"
-          docker push "${IMAGE_SERVER}:${TAG}"
-          docker push "${IMAGE_SERVER}:latest"
-          docker push "${IMAGE_WEB}:${TAG}"
-          docker push "${IMAGE_WEB}:latest"
+          TAR="$(find release-assets -name '*-linux-amd64.tar.gz' | head -n1)"
+          gunzip -c "$TAR" | docker load
+          docker tag "${IMAGE}:${TAG}" "${IMAGE}:latest"
+          docker push "${IMAGE}:${TAG}"
+          docker push "${IMAGE}:latest"
 
       - name: Build release body
         env:
-          IMAGE_SERVER: ${{ needs.prepare.outputs.image_server }}
-          IMAGE_WEB: ${{ needs.prepare.outputs.image_web }}
+          IMAGE: ${{ needs.prepare.outputs.image }}
           TAG: ${{ needs.prepare.outputs.tag }}
         run: |
           set -euo pipefail
           {
-            echo "## Docker（GHCR）"
+            echo "## Docker（GHCR，单镜像含前端+API）"
             echo ""
             echo "\`\`\`bash"
-            echo "docker pull ${IMAGE_SERVER}:${TAG}"
-            echo "docker pull ${IMAGE_WEB}:${TAG}"
+            echo "docker pull ${IMAGE}:${TAG}"
             echo "# 或离线加载："
-            echo "# gunzip -c bidstrat-agent-server-${TAG}-linux-amd64.tar.gz | docker load"
-            echo "# gunzip -c bidstrat-agent-web-${TAG}-linux-amd64.tar.gz | docker load"
+            echo "# gunzip -c bidstrat-agent-${TAG}-linux-amd64.tar.gz | docker load"
             echo "docker compose up -d"
+            echo "# 浏览器打开 http://localhost:3000/"
             echo "\`\`\`"
             echo ""
             echo "## 桌面端"

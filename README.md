@@ -123,8 +123,8 @@ git push origin main
 
 自动完成：
 1. 按已有 `v*` / `x.y.z` tag **patch +1**（首次为 `v1.0.0`）；
-2. 构建 server / web Docker 镜像，产物含 `*-linux-amd64.tar.gz`，发版时推送到 GHCR  
-   （`ghcr.io/<owner>/bidstrat-agent-server`、`bidstrat-agent-web`）；
+2. 构建 **单一** Docker 镜像（前端静态资源 + API），产物含 `*-linux-amd64.tar.gz`，发版时推送到 GHCR  
+   （`ghcr.io/<owner>/bidstrat-agent`）；访问 `http://localhost:3000/`；
 3. 在 Windows / macOS / Linux 分别打包桌面安装包（NSIS、dmg/zip、AppImage/deb）；
 4. 汇总上述产物创建 **GitHub Release**。
 

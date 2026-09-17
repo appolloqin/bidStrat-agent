@@ -8,53 +8,93 @@ import {
   RequirementAnchor,
   buildOutlineFromTenderPositions,
 } from './plan';
+import { discoverResponseSlots, evaluateFillZoneCoverage } from './response-slots';
 
 export type WritingPlanResult = {
   chapters: BidOutlineChapter[];
   tokens: number;
   rationale: string;
   source: 'llm' | 'fallback';
+  rounds?: number;
+  /** 阶段一枚举到的候选位置数 */
+  candidateCount?: number;
+};
+
+/** 阶段一：可能需要作答的原文位置（只枚举，不决定写不写） */
+export type WriteCandidate = {
+  id: string;
+  /** 原文锚点字面 */
+  anchor: string;
+  kind: 'fill_zone' | 'heading' | 'clause';
+  /** 给模型看的摘要（要求/标准/条款片段） */
+  synopsis: string;
 };
 
 /**
- * 收集「可能需要作答」的结构线索，仅作规划上下文提示，不强制选中。
- * 刻意保持弱启发：不绑定某一采购平台模板。
+ * 阶段一 · 枚举：找出所有「可能需要写」的位置。
+ * 不替模型做取舍；填写区、目录标题、相关条款都作为候选。
  */
-export function collectStructureHints(
+export function enumerateWriteCandidates(
   outline: OutlinePath[],
   clauses: ClauseAnchor[],
-): string[] {
-  const hints: string[] = [];
+): WriteCandidate[] {
+  const out: WriteCandidate[] = [];
   const seen = new Set<string>();
-  const push = (line: string) => {
-    const t = line.replace(/\s+/g, ' ').trim();
-    if (!t || t.length < 2 || seen.has(t)) return;
-    seen.add(t);
-    hints.push(t.length > 220 ? `${t.slice(0, 220)}…` : t);
+  const push = (c: Omit<WriteCandidate, 'id'>) => {
+    const key = c.anchor.replace(/\s+/g, '');
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    out.push({ ...c, id: `C${out.length + 1}` });
   };
 
-  for (const o of outline.slice(0, 200)) {
+  const slots = discoverResponseSlots(clauses, outline);
+  for (const s of slots) {
+    const syn = [
+      s.itemTitle ? `评分项：${s.itemTitle}` : '',
+      s.requirementText[0] ? `要求摘要：${s.requirementText[0].slice(0, 180)}` : '',
+      s.scoringText[0] ? `标准摘要：${s.scoringText[0].slice(0, 180)}` : '',
+    ]
+      .filter(Boolean)
+      .join('；');
+    push({
+      anchor: s.responseAnchor,
+      kind: 'fill_zone',
+      synopsis: syn || '原文填写区/投标响应栏',
+    });
+  }
+
+  for (const o of outline.slice(0, 180)) {
     const title = (o.path || o.title || '').trim();
-    if (!title) continue;
-    if (title.length <= 100) push(`目录：${title}`);
+    if (!title || title.length > 80) continue;
+    if (/目录|页码|附表|附件清单/.test(title)) continue;
+    push({
+      anchor: title,
+      kind: 'heading',
+      synopsis: '招标目录/标题节点',
+    });
   }
 
   for (const c of clauses) {
     const path = (c.sectionPath || '').trim();
-    const head = (c.content || '').slice(0, 240);
-    // 短路径一律提供；长正文仅在含「作答意图」弱信号时节选
-    if (path && path.length <= 80) push(`路径：${path}`);
-    if (/响应|填写|应答|评分|评审|要求|在此处|空白|请投标人|不得修改/.test(`${path}\n${head}`)) {
-      push(`条款[${path || '未分组'}]：${head}`);
+    const head = (c.content || '').trim();
+    if (!path || path.length > 80) continue;
+    if (!/要求|评分|评审|响应|资格|技术|商务|服务|交付|废标|否决/.test(`${path}\n${head.slice(0, 80)}`)) {
+      continue;
     }
-    if (hints.length >= 100) break;
+    push({
+      anchor: path,
+      kind: 'clause',
+      synopsis: head.slice(0, 160) || '相关条款',
+    });
   }
-  return hints;
+
+  return out.slice(0, 80);
 }
 
 function parsePlanJson(
   raw: string,
   requirements: RequirementAnchor[],
+  candidates: WriteCandidate[],
 ): { rationale: string; chapters: BidOutlineChapter[] } | null {
   const text = sanitizeLlmOutput(raw);
   const m = text.match(/\{[\s\S]*\}/);
@@ -65,25 +105,39 @@ function parsePlanJson(
       chapters?: Array<Record<string, unknown>>;
     };
     const reqIds = new Set(requirements.map((r) => r.id));
+    const candById = new Map(candidates.map((c) => [c.id, c]));
     const chapters: BidOutlineChapter[] = [];
-    for (const [i, ch] of (obj.chapters ?? []).entries()) {
-      const title = String(ch.title ?? ch.name ?? '').trim();
-      const path = String(ch.tenderAnchor ?? ch.path ?? ch.anchor ?? title).trim();
+
+    for (const ch of obj.chapters ?? []) {
+      const candId = String(ch.candidateId ?? ch.id ?? '').trim();
+      const cand = candId ? candById.get(candId) : undefined;
+      const title = String(ch.title ?? ch.name ?? cand?.anchor ?? '').trim();
+      // 优先用候选字面锚点，避免模型另造位置
+      const path = String(
+        cand?.anchor ?? ch.tenderAnchor ?? ch.path ?? ch.anchor ?? title,
+      ).trim();
       if (!title || !path) continue;
+
       const ids = Array.isArray(ch.requirementIds)
         ? ch.requirementIds.map(String).filter((id) => reqIds.has(id))
         : [];
       const cats = Array.isArray(ch.categories)
         ? (ch.categories.map(String) as RequirementCategory[])
         : deriveCategories(requirements, ids);
-      const context = String(ch.context ?? ch.slotContext ?? '').trim();
+      const how = String(ch.how ?? ch.approach ?? '').trim();
+      const contextParts = [
+        String(ch.context ?? '').trim(),
+        how ? `写法要点：${how}` : '',
+        cand?.synopsis ? `位置摘要：${cand.synopsis}` : '',
+      ].filter(Boolean);
+
       chapters.push({
         no: String(chapters.length + 1),
         title,
         path,
         categories: cats.length ? cats : (['TECHNICAL'] as RequirementCategory[]),
         requirementIds: ids,
-        ...(context ? { context } : {}),
+        ...(contextParts.length ? { context: contextParts.join('\n').slice(0, 6000) } : {}),
       });
     }
 
@@ -109,9 +163,25 @@ function deriveCategories(
   return [...set];
 }
 
+const DECIDE_SYSTEM = [
+  '你是投标文件写作规划专家。',
+  '输入已给出「全部候选作答位置」（阶段一枚举结果）。你只做阶段二自主决策：',
+  '哪些需要写、怎么写、写在什么位置（必须从候选中选）。',
+  '只输出一个 JSON 对象，不要 Markdown。',
+  'JSON：{"rationale":"总体决策说明","chapters":[{"candidateId":"C1","title":"应答标题","how":"怎么写的要点","requirementIds":["要点id"],"categories":["TECHNICAL"],"context":"该位置写作依据摘要"}]}',
+  '规则：',
+  '1) candidateId 必须来自候选列表；tenderAnchor 由系统按 candidateId 回填，你不要另造原文没有的位置。',
+  '2) 不必全选：跳过纯目录/重复/无需投标人填写的位置，并在 rationale 说明取舍。',
+  '3) kind=fill_zone 的填写区通常是投标人作答栏，优先认真评估是否需要写入实质应答。',
+  '4) 禁止用与候选无关的固定六章模板替代填写区。',
+  '5) requirementIds 只能从给定要点 id 中选，可空。',
+].join('\n');
+
 /**
- * 由模型自主决定：写哪些应答、锚定原文何处。
- * 失败时回退到按要点位置分组（非固定六章模板）。
+ * 自主写作规划 = 两阶段：
+ * 1) 枚举所有可能需要写的位置（结构化，不决策）
+ * 2) 模型思考：写哪些、怎么写、锚在哪（从候选中选）
+ * 若首轮对填写区覆盖过低，再给一次校验反馈让模型自行纠偏。
  */
 export async function planWritingByLlm(
   llm: LlmService,
@@ -123,52 +193,89 @@ export async function planWritingByLlm(
   },
 ): Promise<WritingPlanResult> {
   const { tenantId, outline, clauses, requirements } = opts;
-  const hints = collectStructureHints(outline, clauses);
+
+  // —— 阶段一：枚举 ——
+  const candidates = enumerateWriteCandidates(outline, clauses);
+  const slots = discoverResponseSlots(clauses, outline);
+  const candLines = candidates
+    .map((c) => `${c.id} [${c.kind}] anchor=${c.anchor}｜${c.synopsis.slice(0, 120)}`)
+    .join('\n');
   const reqLines = requirements
     .slice(0, 80)
     .map((r, i) => `${i + 1}. id=${r.id} [${r.category}] ${r.content.slice(0, 120)}`)
     .join('\n');
 
-  const { content, tokens } = await llm.chat(
+  let tokens = 0;
+
+  // —— 阶段二：决策 ——
+  const first = await llm.chat(
     [
-      {
-        role: 'system',
-        content: [
-          '你是投标文件写作规划专家，负责自主决策「写什么、写在原文哪里」。',
-          '只输出一个 JSON 对象，不要 Markdown，不要解释性前后文。',
-          'JSON 形状：{"rationale":"简要决策说明","chapters":[{"title":"应答标题","tenderAnchor":"原文锚点标题或路径","requirementIds":["要点id"],"categories":["TECHNICAL"],"context":"写该段时需要的要求/标准摘要"}]}',
-          '决策原则：',
-          '1) 不要照抄全部招标目录；只规划投标人需要填写或实质性应答的段落。',
-          '2) tenderAnchor 尽量使用原文已有标题/路径字面，便于回填到源文件对应位置。',
-          '3) 若结构线索中出现明确填写区、响应栏、评分项应答位，应优先锚定这些位置，并在 context 中摘录对应要求与标准。',
-          '4) 禁止套用与原文无关的固定六章模板（如凭空写投标函/技术方案骨架）。',
-          '5) 章节数量按标书实际需要决定（通常数段到数十段），宁缺毋滥。',
-          '6) requirementIds 只能从给定要点 id 中选择；无匹配可给空数组，改用 context 承载写作依据。',
-        ].join('\n'),
-      },
+      { role: 'system', content: DECIDE_SYSTEM },
       {
         role: 'user',
         content: [
-          '【结构线索（目录/条款摘要，仅供参考）】',
-          hints.join('\n') || '（无线索）',
+          `【阶段一·全部候选作答位置】共 ${candidates.length} 处`,
+          candLines || '（无候选，请根据要点自行保守规划，仍输出 JSON）',
           '',
           '【已提取招标要点】',
           reqLines || '（无）',
           '',
-          '请输出写作规划 JSON。',
+          '请完成阶段二自主决策，输出 JSON。',
         ].join('\n'),
       },
     ],
     { task: 'plan_writing', tenantId },
   );
+  tokens += first.tokens;
 
-  const parsed = parsePlanJson(content, requirements);
+  let parsed = parsePlanJson(first.content, requirements, candidates);
+  let rounds = 1;
+
+  if (parsed && slots.length > 0) {
+    const cov = evaluateFillZoneCoverage(parsed.chapters, slots);
+    if (cov.ratio < 0.5 && cov.missed.length > 0) {
+      const critique = await llm.chat(
+        [
+          { role: 'system', content: DECIDE_SYSTEM },
+          {
+            role: 'user',
+            content: [
+              '阶段二校验未通过，请自主修正后重新输出完整 JSON。',
+              `上一轮 rationale：${parsed.rationale}`,
+              `上一轮选中：${parsed.chapters.map((c) => c.path).join('；')}`,
+              `填写区候选覆盖率仅 ${Math.round(cov.ratio * 100)}%，未覆盖：${cov.missed.join('；')}`,
+              '若某填写区确可不写，须在 rationale 说明；否则请用对应 candidateId 补入。',
+              '',
+              `【阶段一·全部候选】共 ${candidates.length} 处`,
+              candLines,
+              '',
+              '【已提取招标要点】',
+              reqLines || '（无）',
+            ].join('\n'),
+          },
+        ],
+        { task: 'plan_writing', tenantId },
+      );
+      tokens += critique.tokens;
+      const revised = parsePlanJson(critique.content, requirements, candidates);
+      if (revised) {
+        parsed = revised;
+        rounds = 2;
+      }
+    }
+  }
+
   if (parsed) {
     return {
       chapters: parsed.chapters,
       tokens,
-      rationale: parsed.rationale,
+      rationale:
+        rounds > 1
+          ? `（枚举 ${candidates.length} 处候选 → 决策纠偏）${parsed.rationale}`
+          : `（枚举 ${candidates.length} 处候选 → 决策）${parsed.rationale}`,
       source: 'llm',
+      rounds,
+      candidateCount: candidates.length,
     };
   }
 
@@ -176,7 +283,9 @@ export async function planWritingByLlm(
   return {
     chapters: fallback,
     tokens,
-    rationale: '模型规划解析失败，已回退为按要点/条款位置分组',
+    rationale: '模型决策解析失败，已回退为按要点/条款位置分组',
     source: 'fallback',
+    rounds: 0,
+    candidateCount: candidates.length,
   };
 }
